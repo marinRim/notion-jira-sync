@@ -26,5 +26,9 @@ jobs:
         NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
         JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
         JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-        NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+        NOTION_ISSUES_DB_ID: ${{ secrets.NOTION_ISSUES_DB_ID }}
+        NOTION_ACTIVITIES_DB_ID: ${{ secrets.NOTION_ACTIVITIES_DB_ID }}
+        GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        GITLAB_PROJECT_ID: ${{ secrets.GITLAB_PROJECT_ID }}
+        GITLAB_BASE_URL: https://lab.ssafy.com
       run: python notion_jira_sync.py
