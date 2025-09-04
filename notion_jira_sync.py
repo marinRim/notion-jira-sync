@@ -68,7 +68,8 @@ gitlab_headers = {
 def get_jira_user_id(notion_person_name):
     """Notion 담당자명을 Jira 사용자 ID로 매핑"""
     user_mapping = {
-        "marinrRim": "marinrim23@gmail.com"
+        "미림_marinrRim": "marinrim23@gmail.com",
+        "지민 이": "dlwlals062@naver.com"
         # 필요시 팀원 추가: "이름": "이메일@company.com"
     }
     
