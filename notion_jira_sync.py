@@ -15,6 +15,7 @@ JIRA_BASE_URL = os.getenv('JIRA_BASE_URL', 'https://ssafy.atlassian.net')
 JIRA_EMAIL = os.getenv('JIRA_EMAIL')
 JIRA_TOKEN = os.getenv('JIRA_TOKEN')
 NOTION_ISSUES_DB_ID = os.getenv('NOTION_ISSUES_DB_ID')  # 메인 이슈 DB
+NOTION_FRONTEND_DB_ID = os.getenv('NOTION_FRONTEND_DB_ID')  # 프론트엔드 이슈 DB
 NOTION_ACTIVITIES_DB_ID = os.getenv('NOTION_ACTIVITIES_DB_ID')  # 개발 활동 DB
 GITLAB_TOKEN = os.getenv('GITLAB_TOKEN')
 GITLAB_PROJECT_ID = os.getenv('GITLAB_PROJECT_ID')
@@ -30,12 +31,19 @@ if not all(required_vars):
     print(f"NOTION_ISSUES_DB_ID: {'✅ 설정됨' if NOTION_ISSUES_DB_ID else '❌ 없음'}")
     exit(1)
 
-# GitLab 설정 확인
+# 선택적 기능 확인
+if NOTION_FRONTEND_DB_ID:
+    print("✅ 프론트엔드 DB 연동 활성화됨")
+    FRONTEND_ENABLED = True
+else:
+    print("⚠️ 프론트엔드 DB 연동 비활성화됨")
+    FRONTEND_ENABLED = False
+
 if GITLAB_TOKEN and GITLAB_PROJECT_ID and NOTION_ACTIVITIES_DB_ID:
     print("✅ GitLab 연동 활성화됨")
     GITLAB_ENABLED = True
 else:
-    print("⚠️ GitLab 연동 비활성화됨 (일부 환경변수 없음)")
+    print("⚠️ GitLab 연동 비활성화됨")
     GITLAB_ENABLED = False
 
 print("✅ 모든 필수 환경변수가 올바르게 설정되었습니다.")
@@ -56,8 +64,39 @@ gitlab_headers = {
     "Content-Type": "application/json"
 } if GITLAB_TOKEN else {}
 
+# 사용자 매핑 테이블
+def get_jira_user_id(notion_person_name):
+    """Notion 담당자명을 Jira 사용자 ID로 매핑"""
+    user_mapping = {
+        "marinrRim": "marinrim23@gmail.com"
+        # 필요시 팀원 추가: "이름": "이메일@company.com"
+    }
+    
+    jira_email = user_mapping.get(notion_person_name)
+    if not jira_email:
+        return None
+    
+    # Jira에서 사용자 검색
+    search_url = f"{JIRA_BASE_URL}/rest/api/3/user/search"
+    params = {"query": jira_email}
+    
+    response = requests.get(
+        search_url,
+        headers=jira_headers,
+        params=params,
+        auth=(JIRA_EMAIL, JIRA_TOKEN)
+    )
+    
+    if response.status_code == 200:
+        users = response.json()
+        if users:
+            return users[0]["accountId"]
+    
+    return None
+
+# 메인 이슈 DB 관련 함수들
 def get_notion_issues():
-    """Notion 이슈 DB에서 새로운 이슈 가져오기 (Jira 키가 없는 것들)"""
+    """메인 이슈 DB에서 새로운 이슈 가져오기"""
     url = f"https://api.notion.com/v1/databases/{NOTION_ISSUES_DB_ID}/query"
     
     payload = {
@@ -74,11 +113,62 @@ def get_notion_issues():
     if response.status_code == 200:
         return response.json()["results"]
     else:
-        print(f"❌ Notion 이슈 조회 오류: {response.status_code} - {response.text}")
+        print(f"❌ 메인 이슈 조회 오류: {response.status_code} - {response.text}")
+        return []
+
+def get_updated_notion_issues():
+    """메인 이슈 DB에서 최근 수정된 이슈들 가져오기"""
+    url = f"https://api.notion.com/v1/databases/{NOTION_ISSUES_DB_ID}/query"
+    
+    one_hour_ago = (datetime.now() - timedelta(hours=1)).isoformat()
+    
+    payload = {
+        "filter": {
+            "and": [
+                {
+                    "property": "Jira 이슈 키",
+                    "rich_text": {
+                        "is_not_empty": True
+                    }
+                },
+                {
+                    "property": "마지막 동기화",
+                    "date": {
+                        "before": one_hour_ago
+                    }
+                }
+            ]
+        },
+        "sorts": [
+            {
+                "property": "Last edited time",
+                "direction": "descending"
+            }
+        ]
+    }
+    
+    response = requests.post(url, headers=notion_headers, json=payload)
+    
+    if response.status_code == 200:
+        results = response.json()["results"]
+        updated_issues = []
+        for issue in results:
+            last_edited = issue["last_edited_time"]
+            last_sync = None
+            
+            if issue["properties"].get("마지막 동기화") and issue["properties"]["마지막 동기화"]["date"]:
+                last_sync = issue["properties"]["마지막 동기화"]["date"]["start"]
+            
+            if not last_sync or last_edited > last_sync:
+                updated_issues.append(issue)
+        
+        return updated_issues
+    else:
+        print(f"❌ 수정된 메인 이슈 조회 오류: {response.status_code} - {response.text}")
         return []
 
 def get_all_notion_issues():
-    """메인 이슈 DB에서 모든 이슈 가져오기 (GitLab 연동용)"""
+    """메인 이슈 DB에서 모든 이슈 가져오기"""
     url = f"https://api.notion.com/v1/databases/{NOTION_ISSUES_DB_ID}/query"
     
     response = requests.post(url, headers=notion_headers, json={})
@@ -86,11 +176,11 @@ def get_all_notion_issues():
     if response.status_code == 200:
         return response.json()["results"]
     else:
-        print(f"❌ 이슈 DB 조회 오류: {response.status_code} - {response.text}")
+        print(f"❌ 메인 이슈 DB 조회 오류: {response.status_code} - {response.text}")
         return []
 
 def create_jira_issue(notion_page):
-    """Notion 이슈를 기반으로 Jira 이슈 생성"""
+    """메인 이슈를 기반으로 Jira 이슈 생성"""
     properties = notion_page["properties"]
     
     title = properties["제목"]["title"][0]["plain_text"] if properties["제목"]["title"] else "Untitled"
@@ -98,13 +188,18 @@ def create_jira_issue(notion_page):
     priority_map = {"높음": "High", "보통": "Medium", "낮음": "Low"}
     priority = priority_map.get(properties["우선순위"]["select"]["name"] if properties["우선순위"]["select"] else "보통", "Medium")
     
-    print(f"🔄 Jira 이슈 생성 중: {title}")
+    # 담당자 처리
+    assignee_account_id = None
+    if properties.get("담당자") and properties["담당자"]["people"]:
+        notion_person = properties["담당자"]["people"][0]["name"]
+        assignee_account_id = get_jira_user_id(notion_person)
+        print(f"담당자 매핑: {notion_person} → {assignee_account_id}")
+    
+    print(f"🔄 메인 Jira 이슈 생성 중: {title}")
     
     jira_payload = {
         "fields": {
-            "project": {
-                "key": "S13P21A402"
-            },
+            "project": {"key": "S13P21A402"},
             "summary": title,
             "description": {
                 "type": "doc",
@@ -115,20 +210,20 @@ def create_jira_issue(notion_page):
                         "content": [
                             {
                                 "type": "text",
-                                "text": f"From Notion: {description}"
+                                "text": f"From Notion (Main): {description}"
                             }
                         ]
                     }
                 ]
             },
-            "issuetype": {
-                "name": "Task"
-            },
-            "priority": {
-                "name": priority
-            }
+            "issuetype": {"name": "Task"},
+            "priority": {"name": priority}
         }
     }
+    
+    # 담당자가 매핑된 경우에만 추가
+    if assignee_account_id:
+        jira_payload["fields"]["assignee"] = {"accountId": assignee_account_id}
     
     jira_url = f"{JIRA_BASE_URL}/rest/api/3/issue"
     response = requests.post(
@@ -141,16 +236,206 @@ def create_jira_issue(notion_page):
     if response.status_code == 201:
         jira_issue = response.json()
         issue_key = jira_issue["key"]
-        print(f"✅ Jira 이슈 생성 성공: {issue_key}")
+        print(f"✅ 메인 Jira 이슈 생성 성공: {issue_key}")
         
         update_notion_page(notion_page["id"], issue_key)
         return issue_key
     else:
-        print(f"❌ Jira 이슈 생성 실패: {response.status_code} - {response.text}")
+        print(f"❌ 메인 Jira 이슈 생성 실패: {response.status_code} - {response.text}")
         return None
 
+# 프론트엔드 이슈 DB 관련 함수들
+def get_frontend_issues():
+    """프론트엔드 DB에서 새로운 이슈 가져오기"""
+    if not FRONTEND_ENABLED:
+        return []
+    
+    url = f"https://api.notion.com/v1/databases/{NOTION_FRONTEND_DB_ID}/query"
+    
+    payload = {
+        "filter": {
+            "property": "Jira 이슈 키",
+            "rich_text": {
+                "is_empty": True
+            }
+        }
+    }
+    
+    response = requests.post(url, headers=notion_headers, json=payload)
+    
+    if response.status_code == 200:
+        return response.json()["results"]
+    else:
+        print(f"❌ 프론트엔드 이슈 조회 오류: {response.status_code} - {response.text}")
+        return []
+
+def get_updated_frontend_issues():
+    """프론트엔드 DB에서 최근 수정된 이슈들 가져오기"""
+    if not FRONTEND_ENABLED:
+        return []
+    
+    url = f"https://api.notion.com/v1/databases/{NOTION_FRONTEND_DB_ID}/query"
+    
+    one_hour_ago = (datetime.now() - timedelta(hours=1)).isoformat()
+    
+    payload = {
+        "filter": {
+            "and": [
+                {
+                    "property": "Jira 이슈 키",
+                    "rich_text": {
+                        "is_not_empty": True
+                    }
+                },
+                {
+                    "property": "마지막 동기화",
+                    "date": {
+                        "before": one_hour_ago
+                    }
+                }
+            ]
+        },
+        "sorts": [
+            {
+                "property": "Last edited time",
+                "direction": "descending"
+            }
+        ]
+    }
+    
+    response = requests.post(url, headers=notion_headers, json=payload)
+    
+    if response.status_code == 200:
+        results = response.json()["results"]
+        updated_issues = []
+        for issue in results:
+            last_edited = issue["last_edited_time"]
+            last_sync = None
+            
+            if issue["properties"].get("마지막 동기화") and issue["properties"]["마지막 동기화"]["date"]:
+                last_sync = issue["properties"]["마지막 동기화"]["date"]["start"]
+            
+            if not last_sync or last_edited > last_sync:
+                updated_issues.append(issue)
+        
+        return updated_issues
+    else:
+        print(f"❌ 수정된 프론트엔드 이슈 조회 오류: {response.status_code} - {response.text}")
+        return []
+
+def get_all_frontend_issues():
+    """프론트엔드 DB에서 모든 이슈 가져오기"""
+    if not FRONTEND_ENABLED:
+        return []
+    
+    url = f"https://api.notion.com/v1/databases/{NOTION_FRONTEND_DB_ID}/query"
+    
+    response = requests.post(url, headers=notion_headers, json={})
+    
+    if response.status_code == 200:
+        return response.json()["results"]
+    else:
+        print(f"❌ 프론트엔드 이슈 DB 조회 오류: {response.status_code} - {response.text}")
+        return []
+
+def create_frontend_jira_issue(notion_page):
+    """프론트엔드 이슈를 기반으로 Jira 이슈 생성"""
+    properties = notion_page["properties"]
+    
+    title = properties["제목"]["title"][0]["plain_text"] if properties["제목"]["title"] else "Untitled"
+    description = properties["설명"]["rich_text"][0]["plain_text"] if properties["설명"]["rich_text"] else ""
+    priority_map = {"높음": "High", "보통": "Medium", "낮음": "Low"}
+    priority = priority_map.get(properties["우선순위"]["select"]["name"] if properties["우선순위"]["select"] else "보통", "Medium")
+    
+    # 프론트엔드 특화 정보 추출
+    component = properties["컴포넌트"]["select"]["name"] if properties.get("컴포넌트") and properties["컴포넌트"]["select"] else None
+    device = properties["디바이스"]["select"]["name"] if properties.get("디바이스") and properties["디바이스"]["select"] else None
+    browsers = []
+    if properties.get("브라우저") and properties["브라우저"]["multi_select"]:
+        browsers = [item["name"] for item in properties["브라우저"]["multi_select"]]
+    
+    # 담당자 처리
+    assignee_account_id = None
+    if properties.get("담당자") and properties["담당자"]["people"]:
+        notion_person = properties["담당자"]["people"][0]["name"]
+        assignee_account_id = get_jira_user_id(notion_person)
+        print(f"프론트엔드 담당자 매핑: {notion_person} → {assignee_account_id}")
+    
+    print(f"🔄 프론트엔드 Jira 이슈 생성 중: {title}")
+    
+    # 라벨 구성
+    labels = ["Frontend"]
+    if component:
+        labels.append(f"Component:{component}")
+    if device:
+        labels.append(f"Device:{device}")
+    if browsers:
+        labels.extend([f"Browser:{browser}" for browser in browsers])
+    
+    # 설명에 프론트엔드 정보 포함
+    frontend_info = []
+    if component:
+        frontend_info.append(f"컴포넌트: {component}")
+    if device:
+        frontend_info.append(f"디바이스: {device}")
+    if browsers:
+        frontend_info.append(f"브라우저: {', '.join(browsers)}")
+    
+    full_description = f"From Notion (Frontend): {description}"
+    if frontend_info:
+        full_description += f"\n\n--- 프론트엔드 정보 ---\n" + "\n".join(frontend_info)
+    
+    jira_payload = {
+        "fields": {
+            "project": {"key": "S13P21A402"},
+            "summary": f"[FE] {title}",  # 프론트엔드 태그
+            "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": full_description
+                            }
+                        ]
+                    }
+                ]
+            },
+            "issuetype": {"name": "Task"},
+            "priority": {"name": priority},
+            "labels": labels
+        }
+    }
+    
+    # 담당자가 매핑된 경우에만 추가
+    if assignee_account_id:
+        jira_payload["fields"]["assignee"] = {"accountId": assignee_account_id}
+    
+    jira_url = f"{JIRA_BASE_URL}/rest/api/3/issue"
+    response = requests.post(
+        jira_url,
+        headers=jira_headers,
+        json=jira_payload,
+        auth=(JIRA_EMAIL, JIRA_TOKEN)
+    )
+    
+    if response.status_code == 201:
+        jira_issue = response.json()
+        issue_key = jira_issue["key"]
+        print(f"✅ 프론트엔드 Jira 이슈 생성 성공: {issue_key}")
+        
+        update_frontend_notion_page(notion_page["id"], issue_key)
+        return issue_key
+    else:
+        print(f"❌ 프론트엔드 Jira 이슈 생성 실패: {response.status_code} - {response.text}")
+        return None
+
+# 공통 업데이트 함수들
 def update_notion_page(page_id, jira_issue_key):
-    """Notion 페이지에 Jira 이슈 키 업데이트"""
+    """메인 Notion 페이지에 Jira 이슈 키 업데이트"""
     url = f"https://api.notion.com/v1/pages/{page_id}"
     
     payload = {
@@ -175,12 +460,97 @@ def update_notion_page(page_id, jira_issue_key):
     response = requests.patch(url, headers=notion_headers, json=payload)
     
     if response.status_code == 200:
-        print(f"✅ Notion 페이지 업데이트 성공: {jira_issue_key}")
+        print(f"✅ 메인 Notion 페이지 업데이트 성공: {jira_issue_key}")
     else:
-        print(f"❌ Notion 페이지 업데이트 실패: {response.status_code} - {response.text}")
+        print(f"❌ 메인 Notion 페이지 업데이트 실패: {response.status_code} - {response.text}")
 
+def update_frontend_notion_page(page_id, jira_issue_key):
+    """프론트엔드 Notion 페이지에 Jira 이슈 키 업데이트"""
+    url = f"https://api.notion.com/v1/pages/{page_id}"
+    
+    payload = {
+        "properties": {
+            "Jira 이슈 키": {
+                "rich_text": [
+                    {
+                        "text": {
+                            "content": jira_issue_key
+                        }
+                    }
+                ]
+            },
+            "마지막 동기화": {
+                "date": {
+                    "start": datetime.now().isoformat()
+                }
+            }
+        }
+    }
+    
+    response = requests.patch(url, headers=notion_headers, json=payload)
+    
+    if response.status_code == 200:
+        print(f"✅ 프론트엔드 Notion 페이지 업데이트 성공: {jira_issue_key}")
+    else:
+        print(f"❌ 프론트엔드 Notion 페이지 업데이트 실패: {response.status_code} - {response.text}")
+
+def update_existing_jira_issue(notion_page):
+    """기존 Jira 이슈를 Notion 내용으로 업데이트"""
+    properties = notion_page["properties"]
+    
+    if not properties.get("Jira 이슈 키") or not properties["Jira 이슈 키"]["rich_text"]:
+        return False
+    
+    jira_key = properties["Jira 이슈 키"]["rich_text"][0]["plain_text"]
+    
+    title = properties["제목"]["title"][0]["plain_text"] if properties["제목"]["title"] else "Untitled"
+    description = properties["설명"]["rich_text"][0]["plain_text"] if properties["설명"]["rich_text"] else ""
+    priority_map = {"높음": "High", "보통": "Medium", "낮음": "Low"}
+    priority = priority_map.get(properties["우선순위"]["select"]["name"] if properties["우선순위"]["select"] else "보통", "Medium")
+    
+    print(f"🔄 Jira 이슈 업데이트 중: {jira_key} - {title}")
+    
+    update_payload = {
+        "fields": {
+            "summary": title,
+            "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Updated from Notion: {description}"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "priority": {"name": priority}
+        }
+    }
+    
+    jira_url = f"{JIRA_BASE_URL}/rest/api/3/issue/{jira_key}"
+    response = requests.put(
+        jira_url,
+        headers=jira_headers,
+        json=update_payload,
+        auth=(JIRA_EMAIL, JIRA_TOKEN)
+    )
+    
+    if response.status_code == 204:
+        print(f"✅ Jira 이슈 업데이트 성공: {jira_key}")
+        update_notion_page(notion_page["id"], jira_key)
+        return True
+    else:
+        print(f"❌ Jira 이슈 업데이트 실패: {jira_key} - {response.status_code}")
+        return False
+
+# 상태 동기화 함수들
 def sync_status_changes():
-    """Notion의 상태 변경을 Jira에 동기화"""
+    """메인 DB의 상태 변경을 Jira에 동기화"""
     url = f"https://api.notion.com/v1/databases/{NOTION_ISSUES_DB_ID}/query"
     
     payload = {
@@ -189,20 +559,14 @@ def sync_status_changes():
             "rich_text": {
                 "is_not_empty": True
             }
-        },
-        "sorts": [
-            {
-                "property": "마지막 동기화",
-                "direction": "ascending"
-            }
-        ]
+        }
     }
     
     response = requests.post(url, headers=notion_headers, json=payload)
     
     if response.status_code == 200:
         pages = response.json()["results"]
-        print(f"🔄 상태 동기화 대상: {len(pages)}개 이슈")
+        print(f"🔄 메인 상태 동기화 대상: {len(pages)}개 이슈")
         
         for page in pages:
             properties = page["properties"]
@@ -213,7 +577,40 @@ def sync_status_changes():
                 update_jira_status(jira_key, notion_status)
                 update_notion_page(page["id"], jira_key)
     else:
-        print(f"❌ 상태 동기화 API 오류: {response.status_code} - {response.text}")
+        print(f"❌ 메인 상태 동기화 API 오류: {response.status_code} - {response.text}")
+
+def sync_frontend_status_changes():
+    """프론트엔드 DB의 상태 변경을 Jira에 동기화"""
+    if not FRONTEND_ENABLED:
+        return
+    
+    url = f"https://api.notion.com/v1/databases/{NOTION_FRONTEND_DB_ID}/query"
+    
+    payload = {
+        "filter": {
+            "property": "Jira 이슈 키",
+            "rich_text": {
+                "is_not_empty": True
+            }
+        }
+    }
+    
+    response = requests.post(url, headers=notion_headers, json=payload)
+    
+    if response.status_code == 200:
+        pages = response.json()["results"]
+        print(f"🔄 프론트엔드 상태 동기화 대상: {len(pages)}개 이슈")
+        
+        for page in pages:
+            properties = page["properties"]
+            jira_key = properties["Jira 이슈 키"]["rich_text"][0]["plain_text"] if properties["Jira 이슈 키"]["rich_text"] else None
+            notion_status = properties["상태"]["select"]["name"] if properties["상태"]["select"] else None
+            
+            if jira_key and notion_status:
+                update_jira_status(jira_key, notion_status)
+                update_frontend_notion_page(page["id"], jira_key)
+    else:
+        print(f"❌ 프론트엔드 상태 동기화 API 오류: {response.status_code} - {response.text}")
 
 def update_jira_status(jira_key, notion_status):
     """Jira 이슈 상태 업데이트"""
@@ -254,24 +651,15 @@ def get_recent_gitlab_activities():
     if not GITLAB_ENABLED:
         return []
     
-    # 최근 24시간 내 활동만 조회
     since = (datetime.now() - timedelta(hours=24)).isoformat()
-    
     activities = []
     
     try:
-        # 최근 커밋 조회
+        # 커밋 조회
         commits_url = f"{GITLAB_BASE_URL}/api/v4/projects/{GITLAB_PROJECT_ID}/repository/commits"
-        commits_params = {
-            "since": since,
-            "per_page": 20
-        }
+        commits_params = {"since": since, "per_page": 20}
         
-        commits_response = requests.get(
-            commits_url, 
-            headers=gitlab_headers, 
-            params=commits_params
-        )
+        commits_response = requests.get(commits_url, headers=gitlab_headers, params=commits_params)
         
         if commits_response.status_code == 200:
             commits = commits_response.json()
@@ -283,24 +671,14 @@ def get_recent_gitlab_activities():
                     "author": commit["author_name"],
                     "date": commit["created_at"],
                     "url": commit["web_url"],
-                    "id": commit["id"][:8]  # 짧은 ID만 사용
+                    "id": commit["id"][:8]
                 })
-        else:
-            print(f"⚠️ GitLab 커밋 조회 실패: {commits_response.status_code}")
         
-        # 최근 Merge Request 조회
+        # MR 조회
         mrs_url = f"{GITLAB_BASE_URL}/api/v4/projects/{GITLAB_PROJECT_ID}/merge_requests"
-        mrs_params = {
-            "state": "all",
-            "updated_after": since,
-            "per_page": 10
-        }
+        mrs_params = {"state": "all", "updated_after": since, "per_page": 10}
         
-        mrs_response = requests.get(
-            mrs_url,
-            headers=gitlab_headers,
-            params=mrs_params
-        )
+        mrs_response = requests.get(mrs_url, headers=gitlab_headers, params=mrs_params)
         
         if mrs_response.status_code == 200:
             mrs = mrs_response.json()
@@ -315,8 +693,6 @@ def get_recent_gitlab_activities():
                     "state": mr["state"],
                     "id": str(mr["iid"])
                 })
-        else:
-            print(f"⚠️ GitLab MR 조회 실패: {mrs_response.status_code}")
         
         print(f"🔍 GitLab 활동 {len(activities)}개 발견")
         return activities
@@ -330,7 +706,6 @@ def extract_jira_keys_from_text(text):
     if not text:
         return []
     
-    # S13P21A402-123 패턴 찾기
     pattern = r'S13P21A402-\d+'
     return re.findall(pattern, text)
 
@@ -338,7 +713,6 @@ def create_gitlab_activity_in_notion(activity, related_issue_id):
     """GitLab 활동을 개발 활동 데이터베이스에 생성"""
     url = f"https://api.notion.com/v1/pages"
     
-    # 활동 타입 매핑
     activity_type_map = {
         "commit": "커밋",
         "merge_request": "MR"
@@ -353,12 +727,12 @@ def create_gitlab_activity_in_notion(activity, related_issue_id):
                 "title": [
                     {
                         "text": {
-                            "content": activity["title"][:100]  # 제목 길이 제한
+                            "content": activity["title"][:100]
                         }
                     }
                 ]
             },
-            "관련 이슈": {  # Relation 필드
+            "관련 이슈": {
                 "relation": [
                     {
                         "id": related_issue_id
@@ -384,7 +758,7 @@ def create_gitlab_activity_in_notion(activity, related_issue_id):
             },
             "생성일": {
                 "date": {
-                    "start": activity["date"][:10]  # YYYY-MM-DD 형식
+                    "start": activity["date"][:10]
                 }
             },
             "상태": {
@@ -411,7 +785,6 @@ def get_existing_activities():
         
     url = f"https://api.notion.com/v1/databases/{NOTION_ACTIVITIES_DB_ID}/query"
     
-    # 최근 1주일 활동만 조회
     week_ago = (datetime.now() - timedelta(days=7)).isoformat()
     
     payload = {
@@ -430,7 +803,6 @@ def get_existing_activities():
         if response.status_code == 200:
             pages = response.json()["results"]
             for page in pages:
-                # GitLab 링크에서 활동 식별자 추출
                 properties = page["properties"]
                 gitlab_url = properties.get("GitLab 링크", {}).get("url")
                 if gitlab_url:
@@ -446,22 +818,23 @@ def get_existing_activities():
     return existing
 
 def update_notion_with_gitlab_activity():
-    """GitLab 활동을 개발 활동 DB에 반영"""
+    """GitLab 활동을 개발 활동 DB에 반영 (메인 + 프론트엔드 통합)"""
     if not GITLAB_ENABLED:
         print("⚠️ GitLab 연동이 비활성화되어 있습니다.")
         return
     
     print("🔄 GitLab 활동을 개발 활동 DB에 동기화 중...")
     
-    # GitLab 활동 가져오기
     gitlab_activities = get_recent_gitlab_activities()
     
-    # 메인 이슈 DB에서 모든 이슈 가져오기
+    # 메인 + 프론트엔드 이슈 모두 가져오기
     notion_issues = get_all_notion_issues()
+    frontend_issues = get_all_frontend_issues()
+    all_issues = notion_issues + frontend_issues
     
     # Jira 이슈 키별로 Notion 페이지 ID 매핑
     jira_to_notion = {}
-    for issue in notion_issues:
+    for issue in all_issues:
         properties = issue["properties"]
         jira_key = None
         
@@ -471,18 +844,14 @@ def update_notion_with_gitlab_activity():
         if jira_key:
             jira_to_notion[jira_key] = issue["id"]
     
-    # 기존 활동 중복 체크
     existing_activities = get_existing_activities()
     
-    # GitLab 활동을 개발 활동 DB에 생성
     new_activities = 0
     for activity in gitlab_activities:
-        # 이미 존재하는 활동인지 확인
         activity_key = f"{activity['type']}_{activity['id']}"
         if activity_key in existing_activities:
             continue
             
-        # 커밋 메시지나 MR 제목/설명에서 Jira 키 찾기
         text_to_search = f"{activity.get('title', '')} {activity.get('message', '')} {activity.get('description', '')}"
         jira_keys = extract_jira_keys_from_text(text_to_search)
         
@@ -492,45 +861,99 @@ def update_notion_with_gitlab_activity():
                 if create_gitlab_activity_in_notion(activity, related_issue_id):
                     new_activities += 1
                 time.sleep(0.5)
-                break  # 한 번만 생성
+                break
     
     print(f"📊 새로운 GitLab 활동 {new_activities}개가 개발 활동 DB에 추가됨")
 
+def sync_notion_updates():
+    """Notion에서 수정된 내용을 Jira에 반영"""
+    print("🔄 Notion 수정사항을 Jira에 동기화 중...")
+    
+    # 메인 이슈 DB 수정사항
+    updated_main_issues = get_updated_notion_issues()
+    print(f"최근 수정된 메인 이슈 {len(updated_main_issues)}개 발견")
+    
+    success_count = 0
+    for issue in updated_main_issues:
+        if update_existing_jira_issue(issue):
+            success_count += 1
+        time.sleep(1)
+    
+    print(f"메인 이슈 업데이트 완료: {success_count}/{len(updated_main_issues)}")
+    
+    # 프론트엔드 이슈 DB 수정사항 (활성화된 경우)
+    if FRONTEND_ENABLED:
+        updated_frontend_issues = get_updated_frontend_issues()
+        print(f"최근 수정된 프론트엔드 이슈 {len(updated_frontend_issues)}개 발견")
+        
+        fe_success_count = 0
+        for issue in updated_frontend_issues:
+            if update_existing_jira_issue(issue):  # 같은 업데이트 함수 재사용
+                fe_success_count += 1
+            time.sleep(1)
+        
+        print(f"프론트엔드 이슈 업데이트 완료: {fe_success_count}/{len(updated_frontend_issues)}")
+
 def main():
-    """메인 동기화 함수"""
-    print("=" * 70)
-    print("🚀 통합 동기화 시작 (Notion ↔ Jira ↔ GitLab)")
+    """메인 동기화 함수 - 완전한 통합 버전"""
+    print("=" * 80)
+    print("🚀 완전한 통합 동기화 시작 (메인+프론트엔드+수정감지+GitLab)")
     print(f"📅 실행 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 70)
+    print("=" * 80)
     
     try:
-        # 1. 새로운 Notion 이슈를 Jira에 생성
-        print("\n📋 1단계: Notion → Jira 이슈 생성")
+        # 1. 새로운 이슈 생성 (메인)
+        print("\n📋 1단계: 메인 이슈 DB → Jira")
         new_issues = get_notion_issues()
-        print(f"🔍 새로운 이슈 {len(new_issues)}개 발견")
+        print(f"🔍 새로운 메인 이슈 {len(new_issues)}개 발견")
         
-        success_count = 0
+        main_success = 0
         for issue in new_issues:
             if create_jira_issue(issue):
-                success_count += 1
-            time.sleep(1)  # API 제한 고려
+                main_success += 1
+            time.sleep(1)
         
-        print(f"📊 이슈 생성 완료: {success_count}/{len(new_issues)}")
+        print(f"📊 메인 이슈 생성 완료: {main_success}/{len(new_issues)}")
         
-        # 2. 상태 변경 동기화 (Notion → Jira)
-        print("\n🔄 2단계: Notion → Jira 상태 동기화")
+        # 2. 새로운 이슈 생성 (프론트엔드)
+        if FRONTEND_ENABLED:
+            print("\n🎨 1-2단계: 프론트엔드 이슈 DB → Jira")
+            frontend_issues = get_frontend_issues()
+            print(f"🔍 새로운 프론트엔드 이슈 {len(frontend_issues)}개 발견")
+            
+            fe_success = 0
+            for issue in frontend_issues:
+                if create_frontend_jira_issue(issue):
+                    fe_success += 1
+                time.sleep(1)
+            
+            print(f"📊 프론트엔드 이슈 생성 완료: {fe_success}/{len(frontend_issues)}")
+        else:
+            print("\n⚠️ 1-2단계: 프론트엔드 DB 건너뜀 (비활성화됨)")
+        
+        # 3. 수정된 이슈 업데이트
+        print("\n✏️ 2단계: 수정된 이슈 → Jira 업데이트")
+        sync_notion_updates()
+        
+        # 4. 상태 동기화 (메인)
+        print("\n🔄 3단계: 메인 이슈 상태 동기화")
         sync_status_changes()
         
-        # 3. GitLab 활동을 Notion에 반영 (GitLab이 활성화된 경우만)
+        # 5. 상태 동기화 (프론트엔드)
+        if FRONTEND_ENABLED:
+            print("\n🔄 3-2단계: 프론트엔드 이슈 상태 동기화")
+            sync_frontend_status_changes()
+        
+        # 6. GitLab 활동 동기화
         if GITLAB_ENABLED:
-            print("\n🔗 3단계: GitLab → Notion 개발 활동 동기화")
+            print("\n🔗 4단계: GitLab → Notion 개발 활동 동기화")
             update_notion_with_gitlab_activity()
         else:
-            print("\n⚠️ 3단계: GitLab 연동 건너뜀 (비활성화됨)")
+            print("\n⚠️ 4단계: GitLab 연동 건너뜀 (비활성화됨)")
         
-        print("\n" + "=" * 70)
-        print("✅ 통합 동기화 완료!")
-        print("=" * 70)
+        print("\n" + "=" * 80)
+        print("✅ 완전한 통합 동기화 완료!")
+        print("=" * 80)
         
     except Exception as e:
         print(f"\n❌ 동기화 중 오류 발생: {str(e)}")
