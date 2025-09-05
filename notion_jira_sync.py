@@ -895,6 +895,16 @@ def sync_notion_updates():
         
         print(f"프론트엔드 이슈 업데이트 완료: {fe_success_count}/{len(updated_frontend_issues)}")
 
+def sync_assignee_changes():
+    """담당자 변경사항만 별도로 동기화 (빠른 처리)"""
+    print("👤 담당자 변경사항 동기화 시작...")
+    
+    try:
+        detect_assignee_changes()
+        print("✅ 담당자 변경사항 동기화 완료")
+    except Exception as e:
+        print(f"❌ 담당자 동기화 중 오류: {str(e)}")
+
 def main():
     """메인 동기화 함수 - 담당자 변경 감지 포함"""
     print("=" * 80)
