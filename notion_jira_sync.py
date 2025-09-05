@@ -68,8 +68,7 @@ gitlab_headers = {
 def get_jira_user_id(notion_person_name):
     """Notion 담당자명을 Jira 사용자 ID로 매핑"""
     user_mapping = {
-        "미림_marinRim": "marinrim23@gmail.com",
-        "지민 이": "dlwlals062@naver.com"
+        "marinrRim": "marinrim23@gmail.com"
         # 필요시 팀원 추가: "이름": "이메일@company.com"
     }
     
@@ -897,13 +896,13 @@ def sync_notion_updates():
 
 def sync_assignee_changes():
     """담당자 변경사항만 별도로 동기화 (빠른 처리)"""
-    print("👤 담당자 변경사항 동기화 시작...")
+    print("담당자 변경사항 동기화 시작...")
     
     try:
         detect_assignee_changes()
-        print("✅ 담당자 변경사항 동기화 완료")
+        print("담당자 변경사항 동기화 완료")
     except Exception as e:
-        print(f"❌ 담당자 동기화 중 오류: {str(e)}")
+        print(f"담당자 동기화 중 오류: {str(e)}")
 
 def main():
     """메인 동기화 함수 - 담당자 변경 감지 포함"""
